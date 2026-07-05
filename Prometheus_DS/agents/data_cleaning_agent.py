@@ -72,6 +72,7 @@ from Prometheus_DS.tools.dataframe import get_dataframe_summary
 from Prometheus_DS.utils.logging import log_ai_function, log_ai_error
 from Prometheus_DS.utils.sandbox import run_code_sandboxed_subprocess
 from Prometheus_DS.utils.messages import get_last_user_message_content
+from Prometheus_DS.utils.skills import load_skills, load_error_skills, load_strategy_skills, load_pattern_skills
 
 # Setup
 AGENT_NAME = "data_cleaning_agent"
@@ -690,6 +691,9 @@ def make_data_cleaning_agent(
         print(format_agent_name(AGENT_NAME))
         print("    * RECOMMEND CLEANING STEPS")
 
+        # Load skills for context
+        strategy_skills = load_strategy_skills("data_cleaning")
+
         # Prompt to get recommended steps from the LLM
         recommend_steps_prompt = PromptTemplate(
             template="""
@@ -698,16 +702,8 @@ def make_data_cleaning_agent(
             The steps should be tailored to the data characteristics and should be helpful 
             for a data cleaning agent that will be implemented.
             
-            General Steps:
-            Things that should be considered in the data cleaning steps:
-            
-            * Removing columns if more than 40 percent of the data is missing
-            * Imputing missing values with the mean of the column if the column is numeric
-            * Imputing missing values with the mode of the column if the column is categorical
-            * Converting columns to the correct data type
-            * Removing duplicate rows
-            * Removing rows with missing values
-            * Removing rows with extreme outliers (3X the interquartile range)
+            Known Cleaning Strategies (from skill library):
+            {strategies}
             
             Custom Steps:
             * Analyze the data to determine if any additional data cleaning steps are needed.
@@ -733,6 +729,7 @@ def make_data_cleaning_agent(
             2. Do not include unrelated user instructions that are not related to the data cleaning.
             """,
             input_variables=[
+                "strategies",
                 "user_instructions",
                 "recommended_steps",
                 "all_datasets_summary",
@@ -747,6 +744,7 @@ def make_data_cleaning_agent(
         steps_agent = recommend_steps_prompt | llm
         recommended_steps = steps_agent.invoke(
             {
+                "strategies": strategy_skills,
                 "user_instructions": state.get("user_instructions"),
                 "recommended_steps": state.get("recommended_steps"),
                 "all_datasets_summary": all_datasets_summary_str,
@@ -776,6 +774,10 @@ def make_data_cleaning_agent(
             all_datasets_summary_str = state.get("all_datasets_summary")
             steps_for_prompt = state.get("recommended_steps") or DEFAULT_CLEANING_STEPS
 
+        # Load pattern and error skills for code generation
+        pattern_skills = load_pattern_skills("data_cleaning")
+        error_skills = load_error_skills("data_cleaning")
+
         data_cleaning_prompt = PromptTemplate(
             template="""
             You are a Data Cleaning Agent. Your job is to create a {function_name}() function that can be run on the data provided using the following recommended steps.
@@ -789,6 +791,12 @@ def make_data_cleaning_agent(
 
             {all_datasets_summary}
 
+            Code Patterns (use these as reference for implementation):
+            {patterns}
+
+            Known Error Patterns (avoid these mistakes):
+            {error_patterns}
+
             Return Python code in ```python``` format with a single function definition, {function_name}(data_raw), that includes all imports inside the function.
 
             Return code to provide the data cleaning function:
@@ -799,16 +807,20 @@ def make_data_cleaning_agent(
                 ...
                 return data_cleaned
 
-            Best Practices and Error Preventions:
-
-            Always ensure that when assigning the output of fit_transform() from SimpleImputer to a Pandas DataFrame column, you call .ravel() or flatten the array, because fit_transform() returns a 2D array while a DataFrame column is 1D.
-            - Do NOT hardcode column names; derive columns programmatically from the provided data and user instructions.
+            CRITICAL RULES:
+            - Do NOT include any print() statements. The function must ONLY return the cleaned DataFrame.
+            - Always call .ravel() when assigning fit_transform() output to a DataFrame column.
+            - Convert categorical columns to object type BEFORE imputation, then back after.
+            - Do NOT hardcode column names; derive columns programmatically from the provided data.
+            - Strip whitespace from string columns before attempting numeric conversion.
             
             """,
             input_variables=[
                 "recommended_steps",
                 "all_datasets_summary",
                 "function_name",
+                "patterns",
+                "error_patterns",
             ],
         )
 
@@ -819,6 +831,8 @@ def make_data_cleaning_agent(
                 "recommended_steps": steps_for_prompt,
                 "all_datasets_summary": all_datasets_summary_str,
                 "function_name": function_name,
+                "patterns": pattern_skills,
+                "error_patterns": error_skills,
             }
         )
 
@@ -1007,19 +1021,30 @@ def make_data_cleaning_agent(
         }
 
     def fix_data_cleaner_code(state: GraphState):
+        # Load error skills to help with known fixes
+        error_skills = load_error_skills("data_cleaning")
+
         data_cleaner_prompt = """
-        You are a Data Cleaning Agent. Your job is to create a {function_name}() function that can be run on the data provided. The function is currently broken and needs to be fixed.
+        You are a Data Cleaning Agent. Your job is to create a {{function_name}}() function that can be run on the data provided. The function is currently broken and needs to be fixed.
         
-        Make sure to only return the function definition for {function_name}().
+        Make sure to only return the function definition for {{function_name}}().
         
-        Return Python code in ```python``` format with a single function definition, {function_name}(data_raw), that includes all imports inside the function.
+        Return Python code in ```python``` format with a single function definition, {{function_name}}(data_raw), that includes all imports inside the function.
+        
+        Known Error Fixes (check if the error matches any of these):
+        {error_skills}
+        
+        CRITICAL RULES:
+        - Do NOT include any print() statements.
+        - Always call .ravel() when assigning fit_transform() output to a DataFrame column.
+        - Convert categorical columns to object type BEFORE imputation.
         
         This is the broken code (please fix): 
-        {code_snippet}
+        {{code_snippet}}
 
         Last Known Error:
-        {error}
-        """
+        {{error}}
+        """.format(error_skills=error_skills)
 
         return node_func_fix_agent_code(
             state=state,
