@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔥 PrometheusDS
+#  PrometheusDS
 
 ### Self-Evolving AI Agents for End-to-End Data Science
 
